@@ -1,118 +1,242 @@
-#include "PID_v1.h"
+#include <Arduino.h>
+#include <SPI.h>
 #include <Servo.h>
 #include "IMU.h"
 
-#define IMU_CS 13
-#define SPI_SCK 10
-#define SPI_SDI 8
-#define SPI_SDO 11
-#define PWM_SERVO1_PIN 16
-#define PWM_SERVO2_PIN 26
-#define PWM_SERVO3_PIN 27
-#define PWM_SERVO4_PIN 28
+// -------------------- Hardware configuration --------------------
 
+constexpr uint8_t IMU_CS  = 13;
+constexpr uint8_t SPI_SCK = 10;
+constexpr uint8_t SPI_SDI = 8;
+constexpr uint8_t SPI_SDO = 11;
 
+constexpr uint8_t SERVO_1_PIN = 16;
+constexpr uint8_t SERVO_2_PIN = 26;
+constexpr uint8_t SERVO_3_PIN = 27;
+constexpr uint8_t SERVO_4_PIN = 28;
 
-//modify the servo limits (in microseconds)
-#define LOWER_SERVO_LIMIT 600
-#define SERVO_NEUTRAL 1500
-#define UPPER_SERVO_LIMIT 2400
-#define ROLL_GYRO_BIAS 0.98
+// -------------------- Servo configuration --------------------
 
-// Create ICM42688 instance with SPI1 and CS pin 13
+constexpr int SERVO_MIN_US     = 600;
+constexpr int SERVO_NEUTRAL_US = 1500;
+constexpr int SERVO_MAX_US     = 2400;
+
+// Keep the initial control authority limited during bench testing.
+// Increase only after verifying the mechanical system safely.
+constexpr float MAX_CONTROL_US = 300.0f;
+
+// -------------------- Control-loop configuration --------------------
+
+constexpr uint32_t CONTROL_PERIOD_US = 10000;  // 10 ms = 100 Hz
+constexpr float CONTROL_DT_S = 0.010f;
+
+// Desired angular velocity around the rocket's longitudinal Z-axis.
+constexpr float ROLL_RATE_SETPOINT_DPS = 0.0f;
+
+// Initial placeholder gains.
+// These must be tuned experimentally.
+constexpr float KP = 5.0f;    // microseconds per degree/second
+constexpr float KI = 0.10f;   // microseconds per degree
+constexpr float KD = 0.0f;    // microseconds per degree/second^2
+
+// Limits the integral contribution to prevent windup.
+constexpr float INTEGRAL_LIMIT = 200.0f;
+
+// Number of stationary samples used to estimate gyro bias.
+constexpr int GYRO_CALIBRATION_SAMPLES = 500;
+constexpr uint32_t GYRO_CALIBRATION_DELAY_MS = 2;
+
+// -------------------- Objects --------------------
+
 ICM42688 imu(SPI1, IMU_CS);
-Servo servo_1;
-Servo servo_2;
-Servo servo_3;
-Servo servo_4;
-double Setpoint = 0.0;
-//Specify the links and initial tuning parameters
-//assuming Kp is microseconds/degree
-double Kp=5.0, Ki=0.01, Kd=0.1;
-PID myPID(&Setpoint, Kp, Ki, Kd, DIRECT);
 
-unsigned long last_pid_time;
-double roll_from_accel, roll_angle, accel_x, accel_y, accel_z, gyro_z;
+Servo servo1;
+Servo servo2;
+Servo servo3;
+Servo servo4;
 
-double pid_output_us = 0;
+// -------------------- Controller state --------------------
 
+uint32_t previousControlTimeUs = 0;
 
+float gyroZBiasDps = 0.0f;
+float integralError = 0.0f;
+float previousError = 0.0f;
+
+// -------------------- Helper functions --------------------
+
+void commandAllServos(int pulseWidthUs)
+{
+    pulseWidthUs = constrain(
+        pulseWidthUs,
+        SERVO_MIN_US,
+        SERVO_MAX_US
+    );
+
+    servo1.writeMicroseconds(pulseWidthUs);
+    servo2.writeMicroseconds(pulseWidthUs);
+    servo3.writeMicroseconds(pulseWidthUs);
+    servo4.writeMicroseconds(pulseWidthUs);
+}
+
+void commandNeutral()
+{
+    commandAllServos(SERVO_NEUTRAL_US);
+}
+
+float calibrateGyroZBias()
+{
+    Serial.println("Keep the vehicle stationary during gyro calibration.");
+
+    float sum = 0.0f;
+
+    for (int i = 0; i < GYRO_CALIBRATION_SAMPLES; ++i)
+    {
+        imu.readAll();
+        sum += imu.getGyroZ();
+        delay(GYRO_CALIBRATION_DELAY_MS);
+    }
+
+    return sum / static_cast<float>(GYRO_CALIBRATION_SAMPLES);
+}
+
+void resetController()
+{
+    integralError = 0.0f;
+    previousError = 0.0f;
+}
+
+// -------------------- Setup --------------------
 
 void setup()
 {
-last_pid_time = 0;
-//PID setpoint angle: change as needed
-Setpoint = 0;
-roll_angle = 0;
-Serial.begin(115200);
-delay(1000);
+    Serial.begin(115200);
+    delay(1000);
 
-Serial.println("PID test");
-// Configure SPI pins
-SPI1.setSCK(SPI_SCK);
-SPI1.setTX(SPI_SDO);
-SPI1.setRX(SPI_SDI);
-SPI1.begin();
+    Serial.println("Roll-rate stabilization controller");
 
-//configure servo outputs
-servo_1.attach(PWM_SERVO1_PIN, LOWER_SERVO_LIMIT, UPPER_SERVO_LIMIT);
-servo_2.attach(PWM_SERVO2_PIN, LOWER_SERVO_LIMIT, UPPER_SERVO_LIMIT);
-servo_3.attach(PWM_SERVO3_PIN, LOWER_SERVO_LIMIT, UPPER_SERVO_LIMIT);
-servo_4.attach(PWM_SERVO4_PIN, LOWER_SERVO_LIMIT, UPPER_SERVO_LIMIT);
-servo_1.writeMicroseconds(SERVO_NEUTRAL);
-servo_2.writeMicroseconds(SERVO_NEUTRAL);
-servo_3.writeMicroseconds(SERVO_NEUTRAL);
-servo_4.writeMicroseconds(SERVO_NEUTRAL);
+    SPI1.setSCK(SPI_SCK);
+    SPI1.setTX(SPI_SDO);
+    SPI1.setRX(SPI_SDI);
+    SPI1.begin();
 
-// Initialize IMU
-if (imu.begin())
-{
-Serial.println("IMU initialized successfully");
+    servo1.attach(SERVO_1_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    servo2.attach(SERVO_2_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    servo3.attach(SERVO_3_PIN, SERVO_MIN_US, SERVO_MAX_US);
+    servo4.attach(SERVO_4_PIN, SERVO_MIN_US, SERVO_MAX_US);
+
+    commandNeutral();
+
+    if (!imu.begin())
+    {
+        Serial.println("ERROR: IMU initialization failed.");
+
+        // Remain safely at neutral instead of running without valid feedback.
+        while (true)
+        {
+            commandNeutral();
+            delay(100);
+        }
+    }
+
+    Serial.println("IMU initialized successfully.");
+
+    gyroZBiasDps = calibrateGyroZBias();
+
+    Serial.print("Measured gyro Z bias: ");
+    Serial.print(gyroZBiasDps, 4);
+    Serial.println(" deg/s");
+
+    resetController();
+    previousControlTimeUs = micros();
 }
-else
-{
-Serial.println("IMU initialization failed");
-}
 
-myPID.SetMode(AUTOMATIC);
-Serial.println();
-}
+// -------------------- Main control loop --------------------
 
 void loop()
 {
-unsigned long now = millis();
-if (now - last_pid_time >= 10) { //~100Hz control loop
-float dt = (now - last_pid_time) / 100.0f; // dt is exactly the time passed
-//get the accel and gyro inputs
-imu.readAll();
-accel_x = imu.getAccelX();
-accel_y = imu.getAccelY();
-accel_z = imu.getAccelZ();
-gyro_z = imu.getGyroZ();
+    const uint32_t currentTimeUs = micros();
+    const uint32_t elapsedUs = currentTimeUs - previousControlTimeUs;
 
-//comput angle
-roll_from_accel = atan2(accel_y,sqrt(accel_x*accel_x + accel_z*accel_z))*(180.0/PI);
-roll_angle = (ROLL_GYRO_BIAS * (roll_angle +(gyro_z*dt))) + ((1-ROLL_GYRO_BIAS)*roll_from_accel);
+    if (elapsedUs < CONTROL_PERIOD_US)
+    {
+        return;
+    }
 
-//get PID output
-if(myPID.Compute(roll_angle, gyro_z,&pid_output_us)){
-int servo_out_us = (int)round(SERVO_NEUTRAL + pid_output_us);
-//we should clamp this at the lower and upper servo limits first
-if (servo_out_us > UPPER_SERVO_LIMIT){
-  servo_out_us = UPPER_SERVO_LIMIT - 100;
-}
-if (servo_out_us < LOWER_SERVO_LIMIT){
-  servo_out_us = LOWER_SERVO_LIMIT +100;
-}
+    /*
+     * Advance by one scheduled period instead of assigning currentTimeUs.
+     * This reduces long-term schedule drift.
+     */
+    previousControlTimeUs += CONTROL_PERIOD_US;
 
-//Modify this to control all 3 servos
-Serial.println(servo_out_us);
-servo_1.writeMicroseconds(servo_out_us);
-servo_2.writeMicroseconds(servo_out_us);
-servo_3.writeMicroseconds(servo_out_us);
-servo_4.writeMicroseconds(servo_out_us);
+    /*
+     * If execution was delayed excessively, neutralize the servos and reset
+     * the controller rather than applying a command using stale timing.
+     */
+    if (elapsedUs > 3 * CONTROL_PERIOD_US)
+    {
+        commandNeutral();
+        resetController();
+        previousControlTimeUs = currentTimeUs;
 
-}
-last_pid_time = now;
-}
+        Serial.println("WARNING: control-loop deadline missed");
+        return;
+    }
+
+    // Read the current angular velocity around the longitudinal Z-axis.
+    imu.readAll();
+
+    const float measuredGyroZDps = imu.getGyroZ();
+    const float correctedRollRateDps =
+        measuredGyroZDps - gyroZBiasDps;
+
+    /*
+     * Negative feedback:
+     *
+     * If the rocket rotates positively, correctedRollRateDps is positive.
+     * The error becomes negative, producing an opposing servo command.
+     */
+    const float errorDps =
+        ROLL_RATE_SETPOINT_DPS - correctedRollRateDps;
+
+    // Integral term with anti-windup.
+    integralError += errorDps * CONTROL_DT_S;
+    integralError = constrain(
+        integralError,
+        -INTEGRAL_LIMIT,
+        INTEGRAL_LIMIT
+    );
+
+    // Discrete derivative of roll-rate error.
+    const float errorDerivative =
+        (errorDps - previousError) / CONTROL_DT_S;
+
+    previousError = errorDps;
+
+    float controlOutputUs =
+        KP * errorDps +
+        KI * integralError +
+        KD * errorDerivative;
+
+    controlOutputUs = constrain(
+        controlOutputUs,
+        -MAX_CONTROL_US,
+        MAX_CONTROL_US
+    );
+
+    const int servoCommandUs = static_cast<int>(
+        roundf(SERVO_NEUTRAL_US + controlOutputUs)
+    );
+
+    commandAllServos(servoCommandUs);
+
+    // Reduce or remove printing for accurate timing measurements.
+    Serial.print("rate_dps=");
+    Serial.print(correctedRollRateDps, 3);
+    Serial.print(", error_dps=");
+    Serial.print(errorDps, 3);
+    Serial.print(", output_us=");
+    Serial.print(controlOutputUs, 1);
+    Serial.print(", servo_us=");
+    Serial.println(servoCommandUs);
 }
